@@ -16,15 +16,20 @@ class RDBParser:
         self.pos = 0
         
     def read_bytes(self, n):
+        if self.pos + n > len(self.data):
+            # Prevent crashing if we hit the end early
+            n = len(self.data) - self.pos
         res = self.data[self.pos : self.pos + n]
         self.pos += n
         return res
 
     def read_uint8(self):
-        return self.read_bytes(1)[0]
+        b = self.read_bytes(1)
+        return b[0] if b else 0xFF
 
     def read_length(self):
         b = self.read_uint8()
+        if b == 0xFF: return 0, False
         encoding = (b & 0xC0) >> 6
         if encoding == 0: return b & 0x3F, False
         if encoding == 1: return ((b & 0x3F) << 8) | self.read_uint8(), False
@@ -35,39 +40,36 @@ class RDBParser:
     def read_string(self):
         length, is_special = self.read_length()
         if is_special:
+            # Special integer encodings
             if length == 0: return str(struct.unpack('<b', self.read_bytes(1))[0])
             if length == 1: return str(struct.unpack('<h', self.read_bytes(2))[0])
             if length == 2: return str(struct.unpack('<i', self.read_bytes(4))[0])
-            return ""
+            return "" # LZF or other special types
         return self.read_bytes(length).decode('utf-8', errors='ignore')
 
     def skip_value(self, val_type):
-        """Important: Moves the pointer past the value data and returns it."""
-        if val_type == 0: # String
+        """Correctly handles both standard collections and encoded blobs."""
+        # Type 0 (String) AND Types 9-14 (Encoded blobs: Ziplist, Intset, etc.)
+        # In RDB, these are all stored as a single string-encoded block.
+        if val_type == 0 or (val_type >= 9 and val_type <= 14):
             return self.read_string()
         
-        # For Lists, Sets, and Hashes:
-        count, _ = self.read_length()
-        
-        # If it's a Hash, there are 'count' pairs (key and value)
-        if val_type in [4, 9, 13]: 
-            count *= 2
-            
-        for _ in range(count):
-            self.read_string()
-            # Sorted Sets have a score byte after each member
-            if val_type in [3, 12]:
-                self.read_uint8() 
+        # Types 1, 2, 3, 4 are 'Old Style' collections that need looping
+        if val_type in [1, 2, 3, 4]:
+            count, _ = self.read_length()
+            if val_type == 4: count *= 2 # Hash pairs
+            for _ in range(count):
+                self.read_string()
+                if val_type == 3: self.read_string() # ZSet scores
         return "complex_type"
 
 def solve():
-    # 1. Fetch
     print("Fetching problem...")
     resp = requests.get(PROBLEM_URL).json()
     rdb_data = bytearray(base64.b64decode(resp['rdb']))
     target_key = resp['requirements']['check_type_of']
     
-    # 2. Heal
+    # Heal Header
     rdb_data[:9] = b"REDIS0007"
     
     parser = RDBParser(rdb_data)
@@ -88,49 +90,36 @@ def solve():
     last_expiry = None
     seen_dbs = set()
 
-    # 3. Parse Loop
     while parser.pos < len(rdb_data):
         op = parser.read_uint8()
         
-        if op == 0xFF: # End of File
-            break
+        if op == 0xFF: break
         elif op == 0xFE: # Select DB
             db_idx, _ = parser.read_length()
             seen_dbs.add(db_idx)
         elif op == 0xFB: # Resize DB
-            parser.read_length()
-            parser.read_length()
-        elif op == 0xFA: # Aux Fields
-            parser.read_string()
-            parser.read_string()
-        elif op == 0xFD: # Expiry Seconds
+            parser.read_length(); parser.read_length()
+        elif op == 0xFA: # Aux
+            parser.read_string(); parser.read_string()
+        elif op == 0xFD: # Expire Sec
             last_expiry = struct.unpack('<I', parser.read_bytes(4))[0] * 1000
-        elif op == 0xFC: # Expiry Millis
+        elif op == 0xFC: # Expire Millis
             last_expiry = struct.unpack('<Q', parser.read_bytes(8))[0]
         else:
-            # It's a key!
             val_type_name = type_mapping.get(op, "unknown")
             key_name = parser.read_string()
-            
-            # Use skip_value to jump past the value and get the data
             value_data = parser.skip_value(op)
             
-            # Is it the emoji key? (non-ascii)
             if any(ord(c) > 127 for c in key_name):
                 results["emoji_key_value"] = value_data
-            
-            # Is it the type-check key?
             if key_name == target_key:
                 results[target_key] = val_type_name
-            
-            # Did it have an expiry?
             if last_expiry:
                 results["expiry_millis"] = last_expiry
-                last_expiry = None # Reset for next key
+                last_expiry = None
 
     results["db_count"] = len(seen_dbs)
     
-    # 4. Submit
     print("Found Results:", results)
     final_resp = requests.post(SOLVE_URL, json=results)
     print("Hackattic Feedback:", final_resp.text)
