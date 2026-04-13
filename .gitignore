@@ -1,0 +1,17 @@
+# Python virtual environment
+.venv/
+
+# Python cache and compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environment variables / secrets
+.env
+
+# Redis dump file (if this is generated or should not be tracked)
+dump.rdb
+
+# OS files
+.DS_Store
+Thumbs.db
