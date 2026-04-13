@@ -1,15 +1,12 @@
+import os
 import base64
 import requests
-import os
-import struct
 import struct
 from dotenv import load_dotenv
 
 load_dotenv()
-# Configuration
-TOKEN = os.getenv("ACCESS_TOKEN")
-if not TOKEN:
-    raise ValueError("ACCESS_TOKEN not found in .env file! Please check your file.")
+
+TOKEN = os.getenv("ACCESS_TOKEN").strip()
 PROBLEM_URL = f"https://hackattic.com/challenges/the_redis_one/problem?access_token={TOKEN}"
 SOLVE_URL = f"https://hackattic.com/challenges/the_redis_one/solve?access_token={TOKEN}"
 
@@ -41,44 +38,41 @@ class RDBParser:
             if length == 0: return str(struct.unpack('<b', self.read_bytes(1))[0])
             if length == 1: return str(struct.unpack('<h', self.read_bytes(2))[0])
             if length == 2: return str(struct.unpack('<i', self.read_bytes(4))[0])
-            return "" # LZF compression not usually needed for this challenge
+            return ""
         return self.read_bytes(length).decode('utf-8', errors='ignore')
 
     def skip_value(self, val_type):
-        """Moves the pointer past the value data based on its type."""
+        """Important: Moves the pointer past the value data and returns it."""
         if val_type == 0: # String
             return self.read_string()
-        elif val_type in [1, 2, 3, 4, 9, 10, 11, 12, 13, 14]:
-            # Lists, Sets, and Hashes all start with a count of elements
-            count, _ = self.read_length()
+        
+        # For Lists, Sets, and Hashes:
+        count, _ = self.read_length()
+        
+        # If it's a Hash, there are 'count' pairs (key and value)
+        if val_type in [4, 9, 13]: 
+            count *= 2
             
-            # Hash has key AND value (so double the count)
-            if val_type in [4, 9, 13]: 
-                count *= 2
-            
-            # ZSet has string AND score (float)
+        for _ in range(count):
+            self.read_string()
+            # Sorted Sets have a score byte after each member
             if val_type in [3, 12]:
-                for _ in range(count):
-                    self.read_string() # member
-                    self.read_uint8()  # score length or special byte
-            else:
-                for _ in range(count):
-                    self.read_string()
-            return "complex_data"
+                self.read_uint8() 
+        return "complex_type"
 
 def solve():
-    # 1. Fetch Problem
+    # 1. Fetch
+    print("Fetching problem...")
     resp = requests.get(PROBLEM_URL).json()
     rdb_data = bytearray(base64.b64decode(resp['rdb']))
     target_key = resp['requirements']['check_type_of']
     
-    # 2. Heal Header
+    # 2. Heal
     rdb_data[:9] = b"REDIS0007"
     
     parser = RDBParser(rdb_data)
-    parser.pos = 9 # Skip the header
+    parser.pos = 9
     
-    # State tracking
     results = {
         "db_count": 0,
         "emoji_key_value": None,
@@ -94,53 +88,42 @@ def solve():
     last_expiry = None
     seen_dbs = set()
 
-    # 3. Main Loop: Iterate through Opcodes
+    # 3. Parse Loop
     while parser.pos < len(rdb_data):
         op = parser.read_uint8()
         
-        if op == 0xFF: # EOF
+        if op == 0xFF: # End of File
             break
-        elif op == 0xFE: # SELECT DB
+        elif op == 0xFE: # Select DB
             db_idx, _ = parser.read_length()
             seen_dbs.add(db_idx)
-        elif op == 0xFB: # RESIZE DB
-            parser.read_length() # Skip hash table size
-            parser.read_length() # Skip expire hash table size
-        elif op == 0xFA: # AUX Fields (Metadata)
-            parser.read_string() # name
-            parser.read_string() # value
-        elif op == 0xFD: # EXPIRE SECONDS
+        elif op == 0xFB: # Resize DB
+            parser.read_length()
+            parser.read_length()
+        elif op == 0xFA: # Aux Fields
+            parser.read_string()
+            parser.read_string()
+        elif op == 0xFD: # Expiry Seconds
             last_expiry = struct.unpack('<I', parser.read_bytes(4))[0] * 1000
-        elif op == 0xFC: # EXPIRE MILLIS
+        elif op == 0xFC: # Expiry Millis
             last_expiry = struct.unpack('<Q', parser.read_bytes(8))[0]
         else:
-            # This is a Key-Value pair! 
-            # 'op' here is actually the Value Type
-            val_type = type_mapping.get(op, "unknown")
+            # It's a key!
+            val_type_name = type_mapping.get(op, "unknown")
             key_name = parser.read_string()
             
-            # The value part: 
-            # For simplicity, if it's a 'string' type, read it. 
-            # If it's a collection, you might need to skip its elements.
-            if op == 0: # String
-                val_data = parser.read_string()
-            else:
-                # For this challenge, non-string types usually don't contain the emoji.
-                # If they do, we'd need to parse the specific collection structure.
-                val_data = "complex_type" 
-                # (Logic to skip complex types would go here)
-
-            # --- Check requirements ---
+            # Use skip_value to jump past the value and get the data
+            value_data = parser.skip_value(op)
             
-            # 1. Is it the emoji key? (Non-ASCII characters)
+            # Is it the emoji key? (non-ascii)
             if any(ord(c) > 127 for c in key_name):
-                results["emoji_key_value"] = val_data
+                results["emoji_key_value"] = value_data
             
-            # 2. Is it the key we need to type check?
+            # Is it the type-check key?
             if key_name == target_key:
-                results[target_key] = val_type
+                results[target_key] = val_type_name
             
-            # 3. Did it have an expiry?
+            # Did it have an expiry?
             if last_expiry:
                 results["expiry_millis"] = last_expiry
                 last_expiry = None # Reset for next key
@@ -149,8 +132,8 @@ def solve():
     
     # 4. Submit
     print("Found Results:", results)
-    # final_resp = requests.post(SOLVE_URL, json=results)
-    # print(final_resp.json())
+    final_resp = requests.post(SOLVE_URL, json=results)
+    print("Hackattic Feedback:", final_resp.text)
 
 if __name__ == "__main__":
     solve()
