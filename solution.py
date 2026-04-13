@@ -27,30 +27,44 @@ class RDBParser:
         return self.read_bytes(1)[0]
 
     def read_length(self):
-        """Implements the Redis Length Encoding logic."""
         b = self.read_uint8()
         encoding = (b & 0xC0) >> 6
-        
-        if encoding == 0: # 00: 6-bit length
-            return b & 0x3F, False
-        elif encoding == 1: # 01: 14-bit length
-            next_byte = self.read_uint8()
-            return ((b & 0x3F) << 8) | next_byte, False
-        elif encoding == 2: # 10: 32-bit length
-            return struct.unpack('>I', self.read_bytes(4))[0], False
-        elif encoding == 3: # 11: Special (Integer as string)
-            return b & 0x3F, True
+        if encoding == 0: return b & 0x3F, False
+        if encoding == 1: return ((b & 0x3F) << 8) | self.read_uint8(), False
+        if encoding == 2: return struct.unpack('>I', self.read_bytes(4))[0], False
+        if encoding == 3: return b & 0x3F, True
+        return 0, False
 
     def read_string(self):
-        """Reads a Redis-encoded string."""
         length, is_special = self.read_length()
         if is_special:
-            # Special cases: Integer encoded as 1, 2, or 4 bytes
             if length == 0: return str(struct.unpack('<b', self.read_bytes(1))[0])
             if length == 1: return str(struct.unpack('<h', self.read_bytes(2))[0])
             if length == 2: return str(struct.unpack('<i', self.read_bytes(4))[0])
-            return "" # Compressed strings (LZF) not handled for simplicity here
+            return "" # LZF compression not usually needed for this challenge
         return self.read_bytes(length).decode('utf-8', errors='ignore')
+
+    def skip_value(self, val_type):
+        """Moves the pointer past the value data based on its type."""
+        if val_type == 0: # String
+            return self.read_string()
+        elif val_type in [1, 2, 3, 4, 9, 10, 11, 12, 13, 14]:
+            # Lists, Sets, and Hashes all start with a count of elements
+            count, _ = self.read_length()
+            
+            # Hash has key AND value (so double the count)
+            if val_type in [4, 9, 13]: 
+                count *= 2
+            
+            # ZSet has string AND score (float)
+            if val_type in [3, 12]:
+                for _ in range(count):
+                    self.read_string() # member
+                    self.read_uint8()  # score length or special byte
+            else:
+                for _ in range(count):
+                    self.read_string()
+            return "complex_data"
 
 def solve():
     # 1. Fetch Problem
